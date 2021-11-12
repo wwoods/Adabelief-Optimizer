@@ -43,6 +43,7 @@ class RangerAdaBelief(Optimizer):
                  betas=(.95, 0.999), eps=1e-5, weight_decay=0,  # Adam options
                  # Gradient centralization on or off, applied to conv layers only or conv + fc layers
                  use_gc=True, gc_conv_only=False, gc_loc=True, adabelief = True, weight_decouple = True,
+                 rectify=True,
                  ):
 
         # parameter checks
@@ -74,6 +75,7 @@ class RangerAdaBelief(Optimizer):
         self.k = k
 
         # radam buffer for state
+        self.rectify = rectify
         self.radam_buffer = [[None, None, None] for ind in range(10)]
 
         # gc on or off
@@ -166,38 +168,43 @@ class RangerAdaBelief(Optimizer):
                 else:
                     exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
 
-                buffered = self.radam_buffer[int(state['step'] % 10)]
-
-                if state['step'] == buffered[0]:
-                    N_sma, step_size = buffered[1], buffered[2]
+                if self.adabelief:
+                    denom = exp_avg_sq.add_(group['eps']).sqrt().add_(group['eps'])
                 else:
-                    buffered[0] = state['step']
-                    beta2_t = beta2 ** state['step']
-                    N_sma_max = 2 / (1 - beta2) - 1
-                    N_sma = N_sma_max - 2 * \
-                        state['step'] * beta2_t / (1 - beta2_t)
-                    buffered[1] = N_sma
-                    if N_sma > self.N_sma_threshhold:
-                        step_size = math.sqrt((1 - beta2_t) * (N_sma - 4) / (N_sma_max - 4) * (
-                            N_sma - 2) / N_sma * N_sma_max / (N_sma_max - 2)) / (1 - beta1 ** state['step'])
-                    else:
-                        step_size = 1.0 / (1 - beta1 ** state['step'])
-                    buffered[2] = step_size
+                    denom = exp_avg_sq.sqrt().add_(group['eps'])
 
-                # if group['weight_decay'] != 0:
-                #    p_data_fp32.add_(-group['weight_decay']
-                #                     * group['lr'], p_data_fp32)
-
-                # apply lr
-                if N_sma > self.N_sma_threshhold:
-                    if self.adabelief:
-                        denom = exp_avg_sq.add_(group['eps']).sqrt().add_(group['eps'])
-                    else:
-                        denom = exp_avg_sq.sqrt().add_(group['eps'])
-                        
+                if not self.rectify:
+                    bias_correction1 = 1 - beta1 ** state['step']
+                    bias_correction2 = 1 - beta2 ** state['step']
+                    step_size = math.sqrt(bias_correction2) / bias_correction1
                     G_grad = exp_avg / denom
                 else:
-                    G_grad = exp_avg
+                    buffered = self.radam_buffer[int(state['step'] % 10)]
+                    if state['step'] == buffered[0]:
+                        N_sma, step_size = buffered[1], buffered[2]
+                    else:
+                        buffered[0] = state['step']
+                        beta2_t = beta2 ** state['step']
+                        N_sma_max = 2 / (1 - beta2) - 1
+                        N_sma = N_sma_max - 2 * \
+                            state['step'] * beta2_t / (1 - beta2_t)
+                        buffered[1] = N_sma
+                        if N_sma > self.N_sma_threshhold:
+                            step_size = math.sqrt((1 - beta2_t) * (N_sma - 4) / (N_sma_max - 4) * (
+                                N_sma - 2) / N_sma * N_sma_max / (N_sma_max - 2)) / (1 - beta1 ** state['step'])
+                        else:
+                            step_size = 1.0 / (1 - beta1 ** state['step'])
+                        buffered[2] = step_size
+
+                    # if group['weight_decay'] != 0:
+                    #    p_data_fp32.add_(-group['weight_decay']
+                    #                     * group['lr'], p_data_fp32)
+
+                    # apply lr
+                    if N_sma > self.N_sma_threshhold:
+                        G_grad = exp_avg / denom
+                    else:
+                        G_grad = exp_avg
 
                 if self.weight_decouple and (group['weight_decay'] != 0): # decoupled weight decay
                     G_grad.add_(p_data_fp32, alpha=group['weight_decay'])
